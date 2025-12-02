@@ -65,23 +65,23 @@ export const MOCK_DOCTORS: Doctor[] = [
 ];
 
 export const SPECIALTY_STATS = [
-  { specialty: 'Médecin dentiste', count: 450 },
-  { specialty: 'Gynécologue Obstétricien', count: 320 },
-  { specialty: 'Ophtalmologue', count: 280 },
-  { specialty: 'Chirurgien Orthopédiste', count: 210 },
-  { specialty: 'Dermatologue', count: 195 },
-  { specialty: 'Cardiologue', count: 175 },
-  { specialty: 'Oto-Rhino-Laryngologiste', count: 160 },
-  { specialty: 'Généraliste', count: 140 },
+  { specialty: 'Médecin dentiste', count: 138 },
+  { specialty: 'Gynécologue Obstétricien', count: 110 },
+  { specialty: 'Ophtalmologue', count: 88 },
+  { specialty: 'Chirurgien Orthopédiste Traumatologue', count: 68 },
+  { specialty: 'Dermatologue', count: 64 },
+  { specialty: 'Oto-Rhino-Laryngologiste (ORL)', count: 63 },
+  { specialty: 'Généraliste', count: 55 },
+  { specialty: 'Cardiologue', count: 55 },
 ];
 
 export const GOVERNORATE_STATS = [
-  { name: 'Tunis', count: 1250 },
-  { name: 'Ariana', count: 680 },
-  { name: 'Ben Arous', count: 520 },
-  { name: 'Sfax', count: 450 },
-  { name: 'Sousse', count: 380 },
-  { name: 'Monastir', count: 310 },
-  { name: 'Nabeul', count: 290 },
-  { name: 'Bizerte', count: 240 },
+  { name: 'Tunis', count: 476 },
+  { name: 'Sfax', count: 152 },
+  { name: 'Ariana', count: 150 },
+  { name: 'Ben Arous', count: 128 },
+  { name: 'Sousse', count: 114 },
+  { name: 'Nabeul', count: 84 },
+  { name: 'Medenine', count: 52 },
+  { name: 'Monastir', count: 49 },
 ];
