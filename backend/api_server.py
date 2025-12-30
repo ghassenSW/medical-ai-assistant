@@ -1,6 +1,6 @@
 """
 FastAPI Backend for Medical AI Assistant
-Uses RAG (Retrieval Augmented Generation) with Gemini 2.5 Flash
+Uses RAG Fusion (Retrieval Augmented Generation + RRF) with Gemini 2.5 Flash
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,53 +40,39 @@ embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 collection = db.get_collection("embeddings_collection")
 
 # ========== CONVERSATION MEMORY ==========
-# Store conversation history per session (in-memory)
 conversation_memory: Dict[str, List[Dict[str, str]]] = {}
 
 def get_conversation_history(session_id: str, limit: int = 5) -> str:
-    """
-    Retrieves conversation history for a session
-    """
     if session_id not in conversation_memory:
         return "No previous conversation"
-    
     history = conversation_memory[session_id][-limit:]
-    return "\n\n".join([
-        f"{msg['role'].title()}: {msg['content']}" 
-        for msg in history
-    ])
+    return "\n\n".join([f"{msg['role'].title()}: {msg['content']}" for msg in history])
 
 def add_to_memory(session_id: str, role: str, content: str):
-    """
-    Adds a message to conversation memory
-    """
     if session_id not in conversation_memory:
         conversation_memory[session_id] = []
-    
-    conversation_memory[session_id].append({
-        "role": role,
-        "content": content
-    })
-    
-    # Keep only last 20 messages to prevent memory overflow
+    conversation_memory[session_id].append({"role": role, "content": content})
     if len(conversation_memory[session_id]) > 20:
         conversation_memory[session_id] = conversation_memory[session_id][-20:]
 
-# ========== RAG FUNCTIONS ==========
+# ========== RAG FUSION FUNCTIONS ==========
 
 @traceable(name="retrieve_documents")
 def retrieve_documents(query, limit=5):
     """
     Retrieves relevant medical documents from Astra DB vector database
     """
+    # 1. Embed the query
     query_vector = embedding_model.embed_query(query)
     
+    # 2. Search AstraDB
     results = collection.find(
         sort={"$vector": query_vector},
         limit=limit,
         projection={"text": 1, "$vector": 0}
     )
     
+    # 3. Convert to LangChain Documents
     found_docs = []
     for doc_data in results:
         if "text" in doc_data:
@@ -97,40 +83,72 @@ def retrieve_documents(query, limit=5):
 @traceable(name="generate_queries")
 def generate_queries(question):
     """
-    Generates multiple query variations for better retrieval
+    Generates 4 variations of the question using Gemini 2.5 Flash
     """
-    rag_instructions = """You are an AI language model assistant. Your task is to generate five
-    different versions of the given user question to retrieve relevant documents from a vector
-    database. By generating multiple perspectives on the user question, your goal is to help
-    the user overcome some of the limitations of the distance-based similarity search.
-    Provide these alternative questions separated by newlines."""
+    rag_instructions = """You are a helpful medical assistant. 
+    Generate 4 different search queries based on the user's question 
+    to retrieve comprehensive medical advice from a vector database. 
+    Focus on symptoms, treatments, and first aid.
+    Output ONLY the queries separated by newlines."""
     
     response = client_genai.models.generate_content(
         model="gemini-2.5-flash",
-        contents=f"Original question: {question}",
+        contents=f"User Question: {question}",
         config=types.GenerateContentConfig(
             system_instruction=rag_instructions,
-            temperature=0.7
+            temperature=0.7 
         )
     )
     
-    return response.text.split("\n")
+    return [q.strip() for q in response.text.split("\n") if q.strip()]
 
-@traceable(name="get_unique_union")
-def get_unique_union(documents: list[list]):
-    """Unique union of retrieved docs"""
-    flattened_docs = [dumps(doc) for sublist in documents for doc in sublist]
-    unique_docs = list(set(flattened_docs))
-    return [loads(doc) for doc in unique_docs]
+# ---------------------------------------------------------
+# 🔥 NEW PART: RAG FUSION LOGIC (Replaces get_unique_union)
+# ---------------------------------------------------------
+@traceable(name="reciprocal_rank_fusion")
+def reciprocal_rank_fusion(results: list[list], k=60):
+    """
+    Reciprocal Rank Fusion (RRF) algorithm to re-rank documents.
+    Args:
+        results: List of lists of Documents (one list per query variation).
+        k: Smoothing constant (default 60).
+    Returns:
+        List[Document]: Unique documents sorted by relevance score.
+    """
+    fused_scores = {}
 
-# BUILD RAG CHAIN
+    # Iterate through the lists of documents (one list for each of the 4 generated queries)
+    for docs in results:
+        for rank, doc in enumerate(docs):
+            # Serialize doc to use as a unique dictionary key
+            doc_str = dumps(doc)
+            
+            if doc_str not in fused_scores:
+                fused_scores[doc_str] = 0
+            
+            # RRF Formula: 1 / (rank + k)
+            # Documents that appear early (low rank) in multiple lists get higher scores
+            fused_scores[doc_str] += 1 / (rank + k)
+
+    # Sort documents by score (Highest score = Most relevant)
+    reranked_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Return only the documents (we strip the score here for the prompt)
+    return [loads(doc) for doc, score in reranked_results]
+
+# ---------------------------------------------------------
+# BUILD RAG CHAIN WITH FUSION
+# ---------------------------------------------------------
+
 query_generator = RunnableLambda(generate_queries)
 retriever = RunnableLambda(retrieve_documents)
 
+# The Logic: 
+# 1. Generate 4 Queries -> 2. Retrieve docs for EACH -> 3. Fuse & Re-rank
 retrieval_chain = (
     query_generator
     | retriever.map()
-    | get_unique_union
+    | reciprocal_rank_fusion  # <--- This is the key change
 )
 
 @traceable(name="call_gemini_with_rag")
@@ -143,50 +161,50 @@ def call_gemini_with_rag(prompt_value):
     response = client_genai.models.generate_content(
         model="gemini-2.5-flash",
         config=types.GenerateContentConfig(
-            temperature=0,
+            temperature=0.3, # Lower temperature for medical accuracy
         ),
         contents=prompt_str
     )
     
     return response.text
 
-# RAG PROMPT TEMPLATE WITH MEMORY
-rag_template = """You are an intelligent medical AI assistant for Tunisia with access to verified medical knowledge.
+# RAG PROMPT TEMPLATE
+rag_template = """You are an intelligent medical AI assistant for Tunisia.
 
 **CONVERSATION HISTORY:**
 {conversation_history}
 
-**RETRIEVED MEDICAL CONTEXT:**
+**RETRIEVED MEDICAL CONTEXT (Ranked by Relevance):**
 {context}
 
 **USER QUESTION:** {question}
 
 **YOUR INSTRUCTIONS:**
-1. Consider the conversation history for context and continuity
-2. Use the retrieved medical context to provide accurate, evidence-based answers
-3. For medical questions: Provide clear information with appropriate disclaimers
-4. For emergencies: Give immediate first aid + recommend calling SAMU (190)
-5. Always recommend consulting healthcare professionals for serious conditions
-6. Be professional, empathetic, and helpful
-7. Reference previous parts of the conversation when relevant
+1. Consider the conversation history for context.
+2. Use the retrieved medical context to provide accurate answers.
+3. For medical questions: Provide clear info with disclaimers.
+4. For emergencies: Recommend calling SAMU (190).
+5. Be professional and empathetic.
 
 Your response:"""
 
 rag_prompt = ChatPromptTemplate.from_template(rag_template)
 
-# FINAL RAG CHAIN WITH MEMORY
+# FINAL RAG CHAIN
 final_rag_chain = (
-    {"context": retrieval_chain, "question": itemgetter("question"), "conversation_history": itemgetter("conversation_history")}
+    {
+        "context": retrieval_chain, 
+        "question": itemgetter("question"), 
+        "conversation_history": itemgetter("conversation_history")
+    }
     | rag_prompt
     | RunnableLambda(call_gemini_with_rag)
 )
 
 # ========== FASTAPI SERVER ==========
 
-# FastAPI app
 app = FastAPI(title="Medical AI Assistant API")
 
-# Enable CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -197,7 +215,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: str = "default"  # Session ID for conversation memory
+    session_id: str = "default"
     context: Dict[str, Any] = {}
 
 class HealthResponse(BaseModel):
@@ -207,24 +225,19 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "ok",
         "message": "Medical AI Assistant API is running",
-        "model": "gemini-2.5-flash"
+        "model": "gemini-2.5-flash + RAG Fusion"
     }
 
 @app.post("/api/chat")
 async def chat_stream(request: ChatRequest):
-    """
-    Streaming chat endpoint using RAG + Gemini 2.5 Flash with conversation memory
-    """
     async def generate():
         try:
-            # Get conversation history for this session
             history = get_conversation_history(request.session_id)
             
-            # Use RAG chain to get intelligent response
+            # Invoke RAG Fusion Chain
             response_text = final_rag_chain.invoke(
                 {
                     "question": request.message,
@@ -233,14 +246,12 @@ async def chat_stream(request: ChatRequest):
                 config={"run_name": "Medical RAG Query"}
             )
             
-            # Add user message and AI response to memory
             add_to_memory(request.session_id, "user", request.message)
             add_to_memory(request.session_id, "assistant", response_text)
             
-            # Stream the response character by character for smooth UI
             for char in response_text:
                 yield f"data: {json.dumps({'text': char})}\n\n"
-                await asyncio.sleep(0.01)  # Smooth streaming delay
+                await asyncio.sleep(0.005)
                 
         except Exception as e:
             error_message = f"Error: {str(e)}"
@@ -249,40 +260,9 @@ async def chat_stream(request: ChatRequest):
     
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Medical AI Assistant API with RAG & Memory",
-        "version": "2.0.0",
-        "model": "gemini-2.5-flash",
-        "features": ["RAG", "Conversation Memory", "Streaming"],
-        "endpoints": {
-            "health": "/health",
-            "chat": "/api/chat (POST)",
-            "clear_memory": "/api/clear-memory/{session_id} (DELETE)"
-        }
-    }
-
-@app.delete("/api/clear-memory/{session_id}")
-async def clear_memory(session_id: str):
-    """Clear conversation memory for a specific session"""
-    if session_id in conversation_memory:
-        del conversation_memory[session_id]
-        return {"message": f"Memory cleared for session {session_id}"}
-    return {"message": f"No memory found for session {session_id}"}
-
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*60)
-    print("🚀 Starting Medical AI Assistant API with RAG")
+    print("🚀 Starting Medical AI Assistant API with RAG Fusion")
     print("="*60)
-    print("📍 Server: http://localhost:8000")
-    print("📊 Health: http://localhost:8000/health")
-    print("💬 Chat: http://localhost:8000/api/chat")
-    print("🤖 Model: gemini-2.5-flash")
-    print("🔍 RAG: Astra DB Vector Search Enabled")
-    print("📚 Embeddings: all-MiniLM-L6-v2")
-    print("="*60 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
